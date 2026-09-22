@@ -1,0 +1,11 @@
+torch>=2.0.0
+torchvision
+kornia>=0.7.0
+opencv-python>=4.8.0
+matplotlib
+numpy
+scipy
+streamlit
+--extra-index-url https://pypi.org/simple/
+# For SuperPoint + LightGlue (lightweight alternative)
+# git+https://github.com/cvg/LightGlue.git

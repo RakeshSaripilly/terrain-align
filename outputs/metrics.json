@@ -1,0 +1,17 @@
+{
+  "success": true,
+  "raw_matches": 3690,
+  "uniform_matches": 1627,
+  "inlier_count": 1239,
+  "inlier_ratio": 0.8985,
+  "rmse_pixels": 0.5978,
+  "subpixel_accuracy_achieved": false,
+  "spatial_coverage": 1.0,
+  "spatial_entropy": 0.9602,
+  "ncc_cross_correlation": 0.12,
+  "mutual_information": 0.0974,
+  "psnr_db": 15.06,
+  "match_time_sec": 8.438,
+  "total_time_sec": 8.754,
+  "sift_baseline_matches": 126
+}
