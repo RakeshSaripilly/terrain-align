@@ -1,11 +1,3 @@
-
-"""
-batch_isro_evaluator.py
-Handles your QuickMap naming: <img_no>.1.png = high (visible crater), <img_no>.2.png = low (less visibility)
-Example: 1.1.png + 1.2.png = pair 1, 2.1.png + 2.2.png = pair 2 ... 100.1.png + 100.2.png = pair 100
-Total: 200 files = 100 pairs in one folder OR split across two folders
-"""
-
 import os
 import sys
 import re
@@ -14,25 +6,35 @@ import json
 import csv
 import time
 from pathlib import Path
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 import cv2
 import numpy as np
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+# Safe UTF-8 console output for Windows cp1252
+if sys.stdout is not None and hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+CURRENT_DIR = Path(__file__).resolve().parent
+if str(CURRENT_DIR) not in sys.path:
+    sys.path.insert(0, str(CURRENT_DIR))
 
 try:
-    from SunAngle.pipeline import LunarCorrespondenceEngine
-    from SunAngle.isro_metric_evaluator import save_isro_deliverables
-    from SunAngle.evaluation import sift_baseline
-except ImportError:
+    from .pipeline import LunarCorrespondenceEngine
+    from .isro_metric_evaluator import save_isro_deliverables
+    from .evaluation import sift_baseline
+    from .preprocessing import infer_gsd_from_path
+except (ImportError, ValueError):
     from pipeline import LunarCorrespondenceEngine
     from isro_metric_evaluator import save_isro_deliverables
     from evaluation import sift_baseline
+    from preprocessing import infer_gsd_from_path
 
 
 def find_pairs_dot_pattern(pair_dir: str) -> List[Tuple[str, str, str]]:
+
     """
     Your pattern: <img_no>.1.png = high, <img_no>.2.png = low
     Example: 1.1.png + 1.2.png, 23.1.png + 23.2.png
@@ -154,18 +156,19 @@ def run_batch(
     conf_thresh: float = 0.20,
     ransac_thresh: float = 2.0,
     save_vis: bool = True,
-    max_pairs: int = None
+    max_pairs: int = None,
+    gsd_src: Optional[float] = None,
+    gsd_ref: Optional[float] = None,
+    model: str = "homography"
 ):
     # Find pairs with your .1/.2 pattern first
     if pair_dir:
         print(f"[BATCH] Single-folder mode with .1/.2 pattern: {pair_dir}")
         pairs = find_pairs_dot_pattern(pair_dir)
         if len(pairs) == 0:
-            # Fallback to old logic
             from pathlib import Path as P
             all_png = list(P(pair_dir).glob("*.png"))
             print(f"  Found {len(all_png)} files but no .1/.2 pattern, trying generic")
-            # Try generic _low/_high
             pairs = []
     elif low_dir and high_dir:
         print(f"[BATCH] Two-dir mode: {low_dir} + {high_dir}")
@@ -206,10 +209,13 @@ def run_batch(
         pair_out = os.path.join(out_dir, f"{int(pair_id):03d}_{pair_id}" if str(pair_id).isdigit() else f"{idx:03d}_{pair_id}")
         os.makedirs(pair_out, exist_ok=True)
 
+        pair_gsd_ref = gsd_ref if gsd_ref is not None else infer_gsd_from_path(low_path)
+        pair_gsd_src = gsd_src if gsd_src is not None else infer_gsd_from_path(high_path)
+
         try:
             try:
                 sift_n = sift_baseline(low_path, high_path)
-            except:
+            except Exception:
                 sift_n = 0
 
             result = engine.match(
@@ -219,18 +225,24 @@ def run_batch(
                 subpixel_refinement=True,
                 enforce_uniformity=True,
                 max_uniform_points=1200,
-                ransac_thresh=ransac_thresh
+                ransac_thresh=ransac_thresh,
+                gsd0=pair_gsd_ref,
+                gsd1=pair_gsd_src,
+                model=model
             )
 
-            metrics = save_isro_deliverables(result, out_dir=pair_out, save_registered=save_vis)
+            metrics = save_isro_deliverables(
+                result, out_dir=pair_out, save_registered=save_vis,
+                gsd_ref=pair_gsd_ref, gsd_src=pair_gsd_src
+            )
             metrics["pair_id"] = pair_id
             metrics["low_path"] = low_path
             metrics["high_path"] = high_path
             metrics["sift_baseline"] = sift_n
             all_metrics.append(metrics)
 
-            status = "✅ PASS" if metrics["isro_pass"] else "❌ FAIL"
-            print(f"  -> {status} RMSE={metrics['rmse_pixels']:.3f}px Cov3x3={metrics['uniformity_coverage_3x3']*100:.0f}% Inliers={metrics['inlier_count']} SIFT={sift_n}")
+            status = "[PASS]" if metrics["isro_pass"] else "[FAIL]"
+            print(f"  -> {status} RMSE={metrics['rmse_pixels']:.3f}px SDI={metrics.get('sdi', 0.0):.3f} Cov3x3={metrics['uniformity_coverage_3x3']*100:.0f}% Inliers={metrics['inlier_count']} SIFT={sift_n}")
 
             if not metrics["isro_pass"]:
                 failed.append((pair_id, metrics["rmse_pixels"], metrics["uniformity_coverage_3x3"]))
@@ -244,7 +256,11 @@ def run_batch(
                 "high_path": high_path,
                 "total_matches": 0,
                 "inlier_count": 0,
+                "inlier_ratio": 0.0,
                 "rmse_pixels": 999.0,
+                "checkpoint_rmse_px": 999.0,
+                "checkpoint_rmse_meters": 999.0,
+                "sdi": 0.0,
                 "uniformity_coverage_3x3": 0,
                 "isro_pass": False,
                 "error": str(e)
@@ -255,65 +271,74 @@ def run_batch(
 
     if len(all_metrics) > 0:
         rmses = [m["rmse_pixels"] for m in all_metrics if m["rmse_pixels"] < 100]
+        chk_rmses = [m.get("checkpoint_rmse_px", 999.0) for m in all_metrics if m.get("checkpoint_rmse_px", 999.0) < 100]
+        sdis = [m.get("sdi", 0.0) for m in all_metrics]
         inlier_ratios = [m.get("inlier_ratio", 0.0) for m in all_metrics]
-        covs = [m.get("uniformity_coverage_3x3",0) for m in all_metrics]
-        uniformity_entropies = [m.get("uniformity_entropy_3x3", 0.0) for m in all_metrics]
-        passed = sum(1 for m in all_metrics if m.get("isro_pass",False))
+        covs = [m.get("uniformity_coverage_3x3", 0) for m in all_metrics]
+        passed = sum(1 for m in all_metrics if m.get("isro_pass", False))
 
         summary = {
             "total_pairs": len(pairs),
             "evaluated": len(all_metrics),
             "isro_pass_count": int(passed),
-            "isro_pass_rate": round(passed/len(all_metrics)*100,1),
-            "mean_rmse": round(float(np.mean(rmses)),4) if rmses else 999,
-            "median_rmse": round(float(np.median(rmses)),4) if rmses else 999,
-            "mean_inlier_ratio": round(float(np.mean(inlier_ratios))*100,1) if inlier_ratios else 0,
-            "mean_coverage_3x3": round(float(np.mean(covs))*100,1) if covs else 0,
-            "mean_uniformity_coverage_3x3": round(float(np.mean(covs))*100,1) if covs else 0,
-            "mean_uniformity_entropy_3x3": round(float(np.mean(uniformity_entropies)),3) if uniformity_entropies else 0,
-            "batch_time_sec": round(batch_time,1),
-            "time_per_pair": round(batch_time/len(pairs),2) if pairs else 0,
+            "isro_pass_rate": round(passed / len(all_metrics) * 100, 1),
+            "mean_rmse": round(float(np.mean(rmses)), 4) if rmses else 999,
+            "median_rmse": round(float(np.median(rmses)), 4) if rmses else 999,
+            "mean_checkpoint_rmse_px": round(float(np.mean(chk_rmses)), 4) if chk_rmses else 999,
+            "mean_sdi": round(float(np.mean(sdis)), 4) if sdis else 0.0,
+            "mean_inlier_ratio": round(float(np.mean(inlier_ratios)) * 100, 1) if inlier_ratios else 0,
+            "mean_coverage_3x3": round(float(np.mean(covs)) * 100, 1) if covs else 0,
+            "batch_time_sec": round(batch_time, 1),
+            "time_per_pair": round(batch_time / len(pairs), 2) if pairs else 0,
         }
 
-        print("\n" + "="*80)
-        print(" QUICKMAP BATCH SUMMARY - Your .1/.2 pattern")
-        print("="*80)
-        print(f" Total Pairs         : {summary['total_pairs']} (from {summary['total_pairs']*2} PNGs)")
+        # Clean Section 2.D Summary Table
+        print("\n" + "=" * 125)
+        print(" BATCH SCALE-INVARIANT SUMMARY TABLE - SIH26166")
+        print("=" * 125)
+        table_header = f"{'Pair Name':<28} | {'Scale Ratio':<11} | {'Total Matches':<13} | {'Inlier Count':<12} | {'Inlier Ratio':<12} | {'SDI':<6} | {'Checkpoint RMSE (px)':<20} | {'Checkpoint RMSE (m)':<19}"
+        print(table_header)
+        print("-" * 125)
+        for m in all_metrics:
+            p_name = str(m.get("pair_id", "pair"))
+            s_ratio = m.get("scale_ratio", 1.0)
+            tot = m.get("total_matches", 0)
+            inl = m.get("inlier_count", 0)
+            iratio = m.get("inlier_ratio", 0.0) * 100
+            sdi_v = m.get("sdi", 0.0)
+            chk_px = m.get("checkpoint_rmse_px", 999.0)
+            chk_m = m.get("checkpoint_rmse_meters", 999.0)
+            chk_px_str = f"{chk_px:.4f} px" if chk_px < 900 else "N/A"
+            chk_m_str = f"{chk_m:.4f} m" if chk_m < 900 else "N/A"
+            row = f"{p_name[:28]:<28} | {s_ratio:.2f}x{'':<6} | {tot:<13} | {inl:<12} | {iratio:.1f}%{'':<6} | {sdi_v:.3f} | {chk_px_str:<20} | {chk_m_str:<19}"
+            print(row)
+        print("=" * 125)
+
+        print(f" Total Pairs         : {summary['total_pairs']}")
         print(f" ISRO PASS           : {summary['isro_pass_count']}/{summary['total_pairs']} ({summary['isro_pass_rate']}%)")
-        print(f" Mean RMSE           : {summary['mean_rmse']:.4f}px (target <0.5, pass <2.0)")
-        print(f" Median RMSE         : {summary['median_rmse']:.4f}px")
+        print(f" Mean RMSE           : {summary['mean_rmse']:.4f} px (target <0.5, pass <2.0)")
+        print(f" Mean Checkpoint RMSE: {summary['mean_checkpoint_rmse_px']:.4f} px")
+        print(f" Mean SDI            : {summary['mean_sdi']:.4f} (target >= 0.65)")
         print(f" Mean Inlier Ratio   : {summary['mean_inlier_ratio']:.1f}%")
         print(f" Mean Coverage 3x3   : {summary['mean_coverage_3x3']:.1f}% (target >77%)")
-        print(f" Mean Uniformity Ent.: {summary['mean_uniformity_entropy_3x3']:.3f} (target >0.70)")
 
         csv_path = os.path.join(out_dir, "batch_metrics.csv")
-        with open(csv_path, 'w', newline='') as f:
-            fieldnames = ["pair_id","total_matches","inlier_count","inlier_ratio","inlier_count_2px","inlier_ratio_2px","rmse_pixels","uniformity_coverage_3x3","uniformity_entropy_3x3","isro_pass","sift_baseline"]
-            fieldnames = [k for k in fieldnames if k in all_metrics[0]]
+        with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+            fieldnames = [
+                "pair_id", "total_matches", "inlier_count", "inlier_ratio",
+                "inlier_count_2px", "inlier_ratio_2px", "rmse_pixels",
+                "checkpoint_rmse_px", "checkpoint_rmse_meters", "sdi",
+                "uniformity_coverage_3x3", "uniformity_entropy_3x3",
+                "scale_ratio", "isro_pass", "sift_baseline"
+            ]
+            fieldnames = [k for k in fieldnames if any(k in m for m in all_metrics)]
             writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
             writer.writeheader()
             for m in all_metrics:
                 writer.writerow(m)
 
-        with open(os.path.join(out_dir, "batch_summary.json"), 'w') as f:
+        with open(os.path.join(out_dir, "batch_summary.json"), 'w', encoding='utf-8') as f:
             json.dump(summary, f, indent=2)
-
-        try:
-            import matplotlib
-            matplotlib.use('Agg')
-            import matplotlib.pyplot as plt
-            os.makedirs(os.path.join(out_dir, "plots"), exist_ok=True)
-            plt.figure(figsize=(8,5))
-            plt.hist(rmses, bins=25, color='steelblue', edgecolor='black', alpha=0.7)
-            plt.axvline(0.5, color='green', linestyle='--', label='Target 0.5px')
-            plt.axvline(2.0, color='red', linestyle='--', label='Pass 2.0px')
-            plt.xlabel("RMSE (px)"); plt.ylabel("Count")
-            plt.title(f"RMSE - {len(rmses)} QuickMap Pairs (.1 vs .2)")
-            plt.legend(); plt.grid(alpha=0.3)
-            plt.savefig(os.path.join(out_dir, "plots", "rmse_histogram.png"), dpi=150); plt.close()
-            print(f"[Saved] plots/")
-        except Exception as e:
-            print(f"[Plots] skipped: {e}")
 
         print(f"[Saved] {csv_path}")
         print(f"[Saved] {out_dir}/batch_summary.json")
@@ -331,12 +356,15 @@ if __name__ == "__main__":
     parser.add_argument("--ransac", type=float, default=2.0)
     parser.add_argument("--max_pairs", type=int, default=None)
     parser.add_argument("--no_vis", action="store_true")
+    parser.add_argument("--gsd_src", type=float, default=None, help="GSD source/high-sun")
+    parser.add_argument("--gsd_ref", type=float, default=None, help="GSD reference/low-sun")
+    parser.add_argument("--model", type=str, default="homography", choices=["homography", "affine", "tps"])
     args = parser.parse_args()
 
     if not args.pair_dir and not args.low_dir:
         print("Examples for your naming:")
-        print("  python -m SunAngle.batch_isro_evaluator --pair_dir data/quickmap --out batch_outputs")
-        print("  python -m SunAngle.batch_isro_evaluator --low_dir data/low_2 --high_dir data/high_1 --out batch_outputs")
+        print("  python Batch-Isro-Evaluator.py --pair_dir data/quickmap --out batch_outputs")
+        print("  python Batch-Isro-Evaluator.py --low_dir data/low_2 --high_dir data/high_1 --out batch_outputs")
         sys.exit(0)
 
     run_batch(
@@ -348,5 +376,9 @@ if __name__ == "__main__":
         conf_thresh=args.conf,
         ransac_thresh=args.ransac,
         save_vis=not args.no_vis,
-        max_pairs=args.max_pairs
+        max_pairs=args.max_pairs,
+        gsd_src=args.gsd_src,
+        gsd_ref=args.gsd_ref,
+        model=args.model
     )
+

@@ -1,141 +1,158 @@
-# TerrainAlign: Robust Multi-Illumination Surface Image Registration
+# LunarX: Lunar Image Correspondence
 
-A deep feature matching and geometric alignment pipeline for registering complex surface terrain imagery captured under extreme illumination differences, severe shadow variations, and diverse optical sensors.
+Lunar image registration pipeline for matching the same terrain under different
+Sun angles and sensor conditions. The current implementation uses multi-scale
+Local Contrast Normalization (LCN), LoFTR feature matching, spatially uniform
+sampling, subpixel Lucas-Kanade refinement, and USAC MAGSAC homography fitting.
 
-The pipeline integrates multi-scale Local Contrast Normalization (LCN), LoFTR (Local Feature Transformer) detector-free correspondences, spatial uniformity filtering, subpixel Lucas-Kanade refinement, and robust USAC MAGSAC homography estimation.
-
-Optimized for high-resolution aerial, satellite, and orbital optical survey datasets with high incidence angle variance and challenging shadow transitions.
+The pipeline is designed for LRO NAC and Chandrayaan-2 imagery such as OHRC,
+TMC, and IIRS products.
 
 ## Project Structure
 
-Core components and execution scripts:
+The main implementation is inside `SunAngle/`:
 
 ```text
-├── Run-After-Lro.py       # Command-line entry point for dual-image registration
-├── web_app.py             # Interactive Streamlit evaluation interface
-├── pipeline.py            # End-to-end alignment orchestration
-├── Task2pipeline.py       # Extended evaluation pipeline with metric export
-├── isro_metric_evaluator.py # Deliverables and validation metrics module
-├── Batch-Isro-Evaluator.py # Batch image pair evaluator
-├── batch_isro_evaluator.py # Importable batch evaluation API
-├── preprocessing.py       # Normalization, multi-scale LCN, adaptive resizing
-├── matching_engine.py     # LoFTR dense matching engine
-├── subpixel_uniformity.py # Spatial bucket filtering and subpixel LK refinement
-├── geometry_warping.py    # MAGSAC homography fitting, RMSE, image warping
-├── metrics_and_vis.py     # Alignment metrics and visual diagnostic outputs
-├── evaluation.py          # Classical baseline (SIFT) and benchmark helpers
-├── data/sample/           # Sample high/low illumination test pairs
-├── outputs/               # Generated evaluation artifacts
-└── tests/                 # Unit tests and regression suite
+SunAngle/
+├── Run-After-Lro.py       # Command-line entry point
+├── web_app.py             # Interactive Streamlit upload interface
+├── pipeline.py            # End-to-end orchestration
+├── Task2pipeline.py       # Task 2 runner with ISRO deliverables
+├── isro_metric_evaluator.py # Importable ISRO metrics and deliverables API
+├── Batch-Isro-Evaluator.py # Batch .1/.2 pair evaluator
+├── batch_isro_evaluator.py # Importable batch evaluator API
+├── preprocessing.py       # Loading, normalization, multi-scale LCN, resizing
+├── matching_engine.py     # LoFTR matching
+├── subpixel_uniformity.py # Spatial filtering and subpixel refinement
+├── geometry_warping.py    # MAGSAC homography, RMSE, warping
+├── metrics_and_vis.py     # Metrics and visual artifacts
+├── evaluation.py          # SIFT baseline and evaluation helpers
+├── data/sample/           # Sample low-sun and high-sun images
+├── outputs/               # Generated results
+└── tests/                 # Unit and pipeline tests
 ```
 
 ## Installation
 
-1. Clone or download the repository and navigate to the project root:
-
-```bash
-git clone <repository-url>
-cd <project-directory>
-```
-
-2. Create and activate a virtual environment:
+Open PowerShell in the project root:
 
 ```powershell
-# Windows (PowerShell)
+cd C:\College\SIH2026\Codes
+```
+
+Create and activate a virtual environment if one does not already exist:
+
+```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-
-# Linux / macOS
-python3 -m venv .venv
-source .venv/bin/activate
 ```
 
-3. Install required dependencies:
+Install the core dependencies:
 
-```bash
-pip install -r requirements.txt
-pip install streamlit
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r .\requirements.txt
 ```
 
-## Running the Command-Line Pipeline
+The web interface is included in the requirements and uses Streamlit:
 
-To align an image pair with significant illumination or shadow differences:
-
-```bash
-python Run-After-Lro.py \
-    --low ./data/sample/nac_low.png \
-    --high ./data/sample/nac_high.png \
-    --out ./outputs
+```powershell
+.\.venv\Scripts\python.exe -m pip install streamlit
 ```
 
-Replace `--low` and `--high` with your respective reference (e.g. low-angle / high-shadow) and target (e.g. direct-angle / low-shadow) image paths.
+## Run the Command-Line Pipeline
 
-### Pipeline Workflow:
+From `C:\College\SIH2026\Codes`:
 
-1. **Baseline Comparison**: Executes standard keypoint matching baseline (SIFT).
-2. **Preprocessing**: Normalizes dynamic range and adjusts input dimensions.
-3. **Multi-Scale LCN**: Suppresses harsh cast shadows and enhances low-frequency gradient contrast.
-4. **LoFTR Matching**: Produces dense, detector-free point correspondences.
-5. **Spatial Uniformity Filtering**: Distributes match points evenly across a spatial grid.
-6. **Subpixel LK Refinement**: Refines point coordinates to subpixel accuracy.
-7. **Robust Estimation**: Fits a projective homography using USAC MAGSAC.
-8. **Diagnostic Evaluation**: Computes inlier ratio, reprojection RMSE, spatial coverage, entropy, NCC, and PSNR.
-9. **Artifact Export**: Saves warped images, diagnostic maps, and `metrics.json`.
-
-## Running the Extended Assessment Pipeline (Task 2)
-
-To run the extended validation pipeline that exports standard registered products, tie points, homography matrices, and assessment deliverables:
-
-```bash
-python -m Task2pipeline \
-    --low ./data/sample/nac_low.png \
-    --high ./data/sample/nac_high.png \
-    --out ./outputs_task2
+```powershell
+.\.venv\Scripts\python.exe .\SunAngle\Run-After-Lro.py `
+	--low .\SunAngle\data\sample\nac_low.png `
+	--high .\SunAngle\data\sample\nac_high.png `
+	--out .\SunAngle\outputs
 ```
 
-Programmatic access is available via `Task2pipeline.run_task2`, `compute_isro_metrics`, and `save_isro_deliverables`.
+For your own image pair, replace the values of `--low` and `--high` with the
+low-sun/reference and high-sun/target image paths.
 
-Exported deliverables include `registered_product.jpg`, `match_points.csv`, `H.npy`, `metrics.json`, and `isro_metrics.json`.
+The processing order is:
 
-## Batch Evaluation Mode
+1. Run the SIFT baseline.
+2. Load and normalize both images.
+3. Apply multi-scale LCN to reduce illumination differences.
+4. Generate LoFTR correspondences.
+5. Enforce spatially distributed matches.
+6. Refine valid coordinates to subpixel precision.
+7. Estimate a robust homography with USAC MAGSAC.
+8. Calculate inlier ratio, reprojection RMSE, spatial metrics, NCC, mutual information, and PSNR.
+9. Save visual results and `metrics.json`.
 
-The batch module evaluates multiple image pairs concurrently using a shared model session.
+## Run the ISRO Task 2 Pipeline
 
-### Folder Formats:
+The Task 2 runner adds the ISRO metric evaluator and writes the required
+registered product, match points, homography, and metric files:
 
-**Option A: Single folder containing pairs** (e.g. `<id>.1.png` as target and `<id>.2.png` as reference):
+```powershell
+.\.venv\Scripts\python.exe -m SunAngle.Task2pipeline `
+	--low .\SunAngle\data\sample\nac_low.png `
+	--high .\SunAngle\data\sample\nac_high.png `
+	--out .\SunAngle\outputs_task2
+```
+
+The same functionality is available from Python through
+`SunAngle.run_task2`, `SunAngle.compute_isro_metrics`, and
+`SunAngle.save_isro_deliverables`.
+
+Task 2 outputs include `registered_product.jpg`, `match_points.csv`,
+`H.npy`, `metrics.json`, `isro_metrics.json`, and the visual artifacts listed
+below.
+
+## Run Batch ISRO Evaluation
+
+Batch mode evaluates multiple image pairs with one LoFTR engine instance.
+The evaluator supports either of these layouts:
+
+**One folder:** matching files use `<image_id>.1.png` and
+`<image_id>.2.png`. The `.1` image is treated as the high-sun target and `.2`
+as the low-sun reference:
 
 ```text
-pairs_folder/
+quickmap/
 ├── 1.1.png
 ├── 1.2.png
 ├── 2.1.png
 └── 2.2.png
 ```
 
-```bash
-python -m batch_isro_evaluator \
-    --pair_dir ./data/pairs_folder \
-    --out ./batch_outputs
+```powershell
+.\.venv\Scripts\python.exe -m SunAngle.batch_isro_evaluator `
+	--pair_dir .\SunAngle\data\quickmap `
+	--out .\SunAngle\batch_outputs
 ```
 
-**Option B: Separate reference and target folders**:
+**Two folders:** use `--low_dir` for `.2` images and `--high_dir` for `.1`
+images. Files are paired by their shared image ID:
 
-```bash
-python -m batch_isro_evaluator \
-    --low_dir ./data/reference_images \
-    --high_dir ./data/target_images \
-    --out ./batch_outputs
+```powershell
+.\.venv\Scripts\python.exe -m SunAngle.batch_isro_evaluator `
+	--low_dir .\SunAngle\data\low_2 `
+	--high_dir .\SunAngle\data\high_1 `
+	--out .\SunAngle\batch_outputs
 ```
 
-### Useful Parameters:
-- `--max_pairs N`: Limit execution to first N pairs for validation.
-- `--resize 1024`: Maximum image dimension (rescaled maintaining aspect ratio).
-- `--conf 0.2`: LoFTR match confidence threshold.
-- `--ransac 3.0`: Geometric inlier reprojection threshold (in pixels).
-- `--no_vis`: Skip generation of heavy visual maps for faster throughput.
+For a quick validation run, limit the number of pairs:
 
-### Batch Outputs:
+```powershell
+.\.venv\Scripts\python.exe -m SunAngle.batch_isro_evaluator `
+	--pair_dir .\SunAngle\data\quickmap `
+	--out .\SunAngle\batch_outputs `
+	--max_pairs 5
+```
+
+Useful options are `--resize` for the maximum image dimension, `--conf` for
+the LoFTR confidence threshold, `--ransac` for the geometric reprojection
+threshold, and `--no_vis` to skip registered images and visual artifacts.
+Run `python -m SunAngle.batch_isro_evaluator --help` for the complete list.
+
+Batch outputs have this structure:
 
 ```text
 batch_outputs/
@@ -149,50 +166,86 @@ batch_outputs/
 └── plots/rmse_histogram.png
 ```
 
-## Generated Outputs & Metrics
+The per-pair folders also contain homography arrays and visual artifacts when
+visualization is enabled. `batch_metrics.csv` contains one row per evaluated
+pair. `batch_summary.json` contains total pairs, ISRO pass count and rate,
+mean and median RMSE, mean 3x3 coverage, and timing information. The plot is
+written when Matplotlib is available.
 
-| Output File | Description |
+The Streamlit interface exposes the one-folder layout through **Batch folder**:
+choose a local directory with **Browse**, confirm the detected pair count, and
+select **Run batch evaluation**. The web interface downloads
+`batch_metrics.csv` and `batch_summary.json` after completion.
+
+## Generated Outputs
+
+The default output directory is `SunAngle/outputs/`:
+
+| File | Description |
 |---|---|
-| `metrics.json` | Comprehensive numeric evaluation results |
-| `match_lines.jpg` | Correspondence tie lines (green = inliers, red = outliers) |
-| `spatial_density.jpg` | Spatial density distribution across the scene |
-| `checkerboard_overlay.jpg` | Checkerboard alignment verification |
-| `difference_heatmap.jpg` | Pixel-wise residual difference map |
-| `registered_target.jpg` | Warped target image registered to the reference frame |
-| `lcn_ref.jpg` | Contrast-normalized reference image |
-| `lcn_target.jpg` | Contrast-normalized target image |
+| `metrics.json` | Numeric evaluation results |
+| `match_lines.jpg` | Green inlier and red outlier correspondence lines |
+| `spatial_density.jpg` | Spatial distribution of matches |
+| `checkerboard_overlay.jpg` | Reference/registered image alignment view |
+| `difference_heatmap.jpg` | Registration residual heatmap |
+| `registered_target.jpg` | Target image warped into the reference frame |
+| `lcn_ref.jpg` | Normalized reference image |
+| `lcn_target.jpg` | Normalized target image |
 
-### Key Metrics Explained:
-- `raw_matches`: Initial correspondence count passing confidence threshold.
-- `uniform_matches`: Correspondences retained following spatial bucket suppression.
-- `inlier_count`: Matches fitting the computed homography.
-- `inlier_ratio`: Ratio of inliers to spatial matches (`inlier_count / uniform_matches`).
-- `rmse_pixels`: Root mean squared reprojection error of inliers (subpixel goal < 1.0 px).
-- `spatial_coverage` & `spatial_entropy`: Geometric distribution score across grid quadrants.
+Important metrics include:
 
-## Running Tests
+- `raw_matches`: LoFTR matches after confidence filtering.
+- `uniform_matches`: matches retained after spatial filtering.
+- `inlier_count`: matches accepted by the homography model.
+- `inlier_ratio`: `inlier_count / number of processed matches`.
+- `rmse_pixels`: inlier reprojection error in pixels.
+- `spatial_coverage` and `spatial_entropy`: distribution across the image.
 
-Run the test suite with pytest:
+## Run Tests
 
-```bash
-pytest ./tests/test_pipeline.py -q
+Install the test runner if necessary:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install pytest
 ```
 
-## Interactive Web Interface
+Run the SunAngle test suite:
 
-Launch the interactive Streamlit application:
-
-```bash
-streamlit run web_app.py
+```powershell
+.\.venv\Scripts\python.exe -m pytest .\SunAngle\tests\test_pipeline.py -q
 ```
 
-Features:
-- Single pair alignment with interactive visual comparison (side-by-side, slider, checkerboard, difference heatmap).
-- Real-time parameter tuning (confidence thresholds, RANSAC margins, spatial grid sizes).
-- Batch folder processing with automated metrics export (`batch_metrics.csv`, `batch_summary.json`).
+## Run the Interactive Web Interface
 
-## Hardware & Acceleration
+From `c:\College\SIH2026\SIH26166\Codes\LunarX`:
 
-- **GPU**: Automatically leverages CUDA when available for high-throughput tensor operations.
-- **CPU**: Full fallback support for standard CPU environments.
-- **Image Sizing**: Images are automatically rescaled to 1024px maximum dimension for optimal balance between spatial accuracy and GPU memory consumption.
+```powershell
+..\.venv\Scripts\python.exe -m streamlit run web_app.py
+```
+
+Streamlit opens the interface in a browser at `http://localhost:8501`.
+
+### Supported Web UI Modes:
+1. **Single Pair (Multi-Scale Alignment)**:
+   - Upload Reference Image (Low-Sun / Coarse / Base) and Target Image (High-Sun / Fine / Target).
+   - Select or auto-detect sensor/GSD (OHRC 0.25m, LRO NAC 0.5m, TMC-2 5.0m, SELENE 10.0m, IIRS 80.0m, or Custom GSD).
+   - Live scale ratio banner indicating MTF anti-aliasing filter and downsampling factor.
+   - Computes sub-pixel tie points (Gruen LSM / LK fallback), MAGSAC++ homography, and displays:
+     - ISRO metrics (RMSE, 80/20 Checkpoint RMSE in px & ground meters, SDI 8x8, 3x3 Grid Coverage, Scale consistency).
+     - Interactive tabs for Inlier Correspondences, Diagnostic Checkerboards, Difference Heatmaps, Spatial Densities, and Match Points table.
+     - Single-click downloads for `registered_product.jpg`, `match_points.csv`, `isro_metrics.json`, and complete ZIP bundle.
+2. **Group of Images (Multi-Scale Correspondence)**:
+   - Upload 1 Anchor Reference Image and multiple Target Images of varying scales (e.g. TMC-2 vs. OHRC, NAC, IIRS).
+   - Real-time progress bar across all target images.
+   - Interactive Group Summary Table (Scale ratios, Inliers, Inlier Ratios, Checkpoint RMSE px & m, SDI 8x8, Scale checks, ISRO status).
+   - Dropdown inspector to view individual registration artifacts for any image in the group.
+   - Download `group_summary.csv`, `group_summary.json`, and full Group ZIP bundle.
+3. **Batch Folder (Local Directory)**:
+   - Evaluates a local folder containing paired images with summary statistics and CSV export.
+
+## Hardware
+
+The matcher automatically uses CUDA when available and otherwise runs on CPU.
+CPU execution is supported but can be slower for large images. Input images are
+resized to a maximum long dimension of 1024 pixels by default; this can be
+changed through the pipeline API or by editing the runner configuration.

@@ -13,7 +13,13 @@ import torch
 ssl._create_default_https_context = ssl._create_unverified_context
 
 from kornia.feature import LoFTR
-from SunAngle.preprocessing import preprocess_lunar_pair, local_contrast_normalization
+try:
+    from .preprocessing import preprocess_lunar_pair, local_contrast_normalization
+except (ImportError, ValueError):
+    try:
+        from preprocessing import preprocess_lunar_pair, local_contrast_normalization
+    except ImportError:
+        from SunAngle.preprocessing import preprocess_lunar_pair, local_contrast_normalization
 
 
 class LunarLoFTRMatcher:

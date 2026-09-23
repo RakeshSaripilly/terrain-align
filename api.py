@@ -1,7 +1,7 @@
 """
 SunAngle/api.py
-FastAPI REST API Service for Image Correspondence.
-Exposes modular endpoints for multi-modal, illumination, and scale-invariant correspondence.
+FastAPI REST API Service for SIH26166.
+Exposes modular endpoints for lunar multi-modal, sun angle, and scale-invariant correspondence.
 """
 
 import os
@@ -21,8 +21,8 @@ if str(PROJECT_ROOT) not in sys.path:
 from SunAngle.pipeline import LunarCorrespondenceEngine
 
 app = FastAPI(
-    title="Surface Image Correspondence Engine API",
-    description="Multi-Modal, Illumination and Scale Invariant Registration Engine",
+    title="SIH26166 Lunar Image Correspondence Engine API",
+    description="Multi-Modal, Sun Angle and Scale Invariant Registration Engine for Chandrayaan-2 (OHRC, TMC, IIRS)",
     version="1.0.0"
 )
 
@@ -45,14 +45,19 @@ class MatchPathRequest(BaseModel):
     subpixel_refinement: Optional[bool] = True
     enforce_uniformity: Optional[bool] = True
     ransac_thresh: Optional[float] = 2.0
+    gsd_ref: Optional[float] = None
+    gsd_src: Optional[float] = None
+    model: Optional[str] = "homography"
+    k_min: Optional[int] = 5
+    k_max: Optional[int] = 25
 
 
 @app.get("/api/v1/health")
 def health_check() -> Dict[str, Any]:
     return {
         "status": "online",
-        "pipeline": "TerrainAlign",
-        "supported_sensors": ["Optical_HR", "Stereo", "Multispectral"],
+        "problem_statement": "SIH26166",
+        "supported_sensors": ["OHRC", "TMC", "IIRS", "LRO_NAC"],
         "target_rmse_threshold": "< 0.5 pixels",
         "device": str(get_engine().matcher.device)
     }
@@ -73,7 +78,12 @@ def match_by_path(req: MatchPathRequest) -> Dict[str, Any]:
         conf_thresh=req.conf_thresh,
         subpixel_refinement=req.subpixel_refinement,
         enforce_uniformity=req.enforce_uniformity,
-        ransac_thresh=req.ransac_thresh
+        ransac_thresh=req.ransac_thresh,
+        gsd0=req.gsd_ref,
+        gsd1=req.gsd_src,
+        model=req.model,
+        k_min=req.k_min,
+        k_max=req.k_max
     )
 
     return {
@@ -83,7 +93,12 @@ def match_by_path(req: MatchPathRequest) -> Dict[str, Any]:
         "inlier_count": res["inlier_count"],
         "inlier_ratio": res["inlier_ratio"],
         "rmse_pixels": res["rmse_pixels"],
+        "checkpoint_rmse_px": res.get("checkpoint_rmse_px", 0.0),
+        "checkpoint_rmse_meters": res.get("checkpoint_rmse_meters", 0.0),
+        "sdi": res.get("sdi", 0.0),
         "subpixel_accurate": res["subpixel_accurate"],
+        "scale_ratio": res.get("scale_ratio", 1.0),
+        "scale_consistency_pass": res.get("scale_consistency_pass", True),
         "spatial_coverage": res["spatial_coverage"],
         "spatial_entropy": res["spatial_entropy"],
         "H_matrix": res["H_scaled"],

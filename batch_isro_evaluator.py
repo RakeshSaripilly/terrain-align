@@ -42,9 +42,11 @@ def main() -> None:
     parser.add_argument("--out", default="batch_outputs_quickmap_dot")
     parser.add_argument("--resize", type=int, default=1024)
     parser.add_argument("--conf", type=float, default=0.20)
-    parser.add_argument("--ransac", type=float, default=2.0)
     parser.add_argument("--max_pairs", type=int, default=None)
     parser.add_argument("--no_vis", action="store_true")
+    parser.add_argument("--gsd_src", type=float, default=None, help="GSD source/high-sun")
+    parser.add_argument("--gsd_ref", type=float, default=None, help="GSD reference/low-sun")
+    parser.add_argument("--model", type=str, default="homography", choices=["homography", "affine", "tps"])
     args = parser.parse_args()
 
     if not args.pair_dir and not (args.low_dir and args.high_dir):
@@ -60,7 +62,11 @@ def main() -> None:
         ransac_thresh=args.ransac,
         save_vis=not args.no_vis,
         max_pairs=args.max_pairs,
+        gsd_src=args.gsd_src,
+        gsd_ref=args.gsd_ref,
+        model=args.model,
     )
+
 
 
 if __name__ == "__main__":

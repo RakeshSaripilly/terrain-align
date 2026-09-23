@@ -1,7 +1,7 @@
 """
 SunAngle/metrics_and_vis.py
-Surface Image Registration Evaluation Metrics and Visualization Generator
-Phase 3 implementation: Metrics computation and visualization.
+Planetary Image Registration Evaluation Metrics and Visualization Generator
+Phase 3 implementation for SIH26166.
 """
 
 import os

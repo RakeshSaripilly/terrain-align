@@ -1,0 +1,57 @@
+{
+  "total_matches": 1792,
+  "inlier_count": 1792,
+  "inlier_ratio": 1.0,
+  "inlier_count_1px": 1792,
+  "inlier_ratio_1px": 1.0,
+  "inlier_count_2px": 1792,
+  "inlier_ratio_2px": 1.0,
+  "success_rate_2px": 1.0,
+  "inlier_count_3px": 1792,
+  "inlier_ratio_3px": 1.0,
+  "rmse_pixels": 0.0401,
+  "mean_error_pixels": 0.0294,
+  "median_error_pixels": 0.0215,
+  "max_error_pixels": 0.3256,
+  "subpixel_accuracy": true,
+  "subpixel_05": true,
+  "rmse_target_05": "<0.5 px target",
+  "rmse_pass_2px": true,
+  "uniformity_coverage_3x3": 1.0,
+  "uniformity_entropy_3x3": 0.9983,
+  "uniformity_hist_3x3": [
+    [
+      203,
+      189,
+      195
+    ],
+    [
+      200,
+      240,
+      180
+    ],
+    [
+      201,
+      206,
+      178
+    ]
+  ],
+  "uniformity_occupied_3x3": 9,
+  "uniformity_empty_3x3": 0,
+  "uniformity_coverage_6x6": 1.0,
+  "uniformity_entropy_6x6": 0.9945,
+  "uniformity_coverage_8x8": 1.0,
+  "uniformity_entropy_8x8": 1.0,
+  "isro_pass_rmse": true,
+  "isro_pass_coverage": true,
+  "isro_pass": true,
+  "method_robust": "USAC_MAGSAC (MAGSAC++) with fallback RANSAC",
+  "method_refinement": "Inverse-Compositional Lucas-Kanade + cornerSubPix",
+  "method_uniformity": "Quadtree binning 8x8 + ANMS",
+  "raw_matches": 7936,
+  "uniform_matches": 1792,
+  "scale0": 0.8547579298831386,
+  "scale1": 0.8547579298831386,
+  "elapsed_total_sec": 9.389,
+  "elapsed_match_sec": 9.145
+}

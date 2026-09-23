@@ -39,21 +39,91 @@ def compute_reprojection_rmse(
     return round(rmse, 4), residuals
 
 
+def compute_scale_consistency(
+    matrix: np.ndarray,
+    expected_scale_ratio: float,
+    eval_point: Tuple[float, float] = (512.0, 512.0),
+    tolerance: float = 0.15
+) -> Dict[str, Any]:
+    """
+    Scale Consistency Check:
+    Verifies that the determinant of the estimated local transformation matrix |J|
+    matches the physical GSD scale factor squared (s^2 +- 15%).
+    
+    Args:
+        matrix: (2, 3) affine matrix or (3, 3) homography
+        expected_scale_ratio: s = GSD_ref / GSD_src
+        eval_point: Point (x, y) at which to evaluate Jacobian
+        tolerance: Allowed fractional deviation (default 15% = 0.15)
+    """
+    if matrix is None:
+        return {"scale_consistency_pass": False, "det_J": 0.0, "expected_scale_sq": 0.0, "scale_error_ratio": 1.0}
+
+    s_expected_sq = float(expected_scale_ratio ** 2)
+
+    if matrix.shape == (2, 3):
+        # Affine matrix [ [a1, a2, a0], [b1, b2, b0] ]
+        det_J = abs(float(matrix[0, 0] * matrix[1, 1] - matrix[0, 1] * matrix[1, 0]))
+    elif matrix.shape == (3, 3):
+        # Homography: local Jacobian determinant at eval_point (x, y)
+        x, y = float(eval_point[0]), float(eval_point[1])
+        h11, h12, h13 = matrix[0]
+        h21, h22, h23 = matrix[1]
+        h31, h32, h33 = matrix[2]
+        den = h31 * x + h32 * y + h33
+        if abs(den) < 1e-8:
+            det_J = abs(float(np.linalg.det(matrix[:2, :2])))
+        else:
+            num_x = h11 * x + h12 * y + h13
+            num_y = h21 * x + h22 * y + h23
+            dx_dx = (h11 * den - num_x * h31) / (den * den)
+            dx_dy = (h12 * den - num_x * h32) / (den * den)
+            dy_dx = (h21 * den - num_y * h31) / (den * den)
+            dy_dy = (h22 * den - num_y * h32) / (den * den)
+            det_J = abs(float(dx_dx * dy_dy - dx_dy * dy_dx))
+    else:
+        det_J = 1.0
+
+    if s_expected_sq > 0:
+        error_ratio = abs(det_J - s_expected_sq) / s_expected_sq
+        passed = bool(error_ratio <= tolerance)
+    else:
+        error_ratio = 0.0
+        passed = True
+
+    return {
+        "scale_consistency_pass": passed,
+        "det_J": round(float(det_J), 4),
+        "expected_scale_sq": round(float(s_expected_sq), 4),
+        "scale_error_ratio": round(float(error_ratio), 4),
+        "tolerance": tolerance
+    }
+
+
 def estimate_robust_transformation(
     pts0: np.ndarray,
     pts1: np.ndarray,
     ransac_thresh: float = 2.0,
     max_iters: int = 15000,
-    confidence: float = 0.999
+    confidence: float = 0.999,
+    model: str = "homography",
+    gsd_ratio: float = 1.0
 ) -> Dict[str, Any]:
     """
     Robust geometric estimation using USAC_MAGSAC (or RANSAC fallback).
-    Computes homography, inlier mask, and precision RMSE.
+    Supports homography, affine, and Thin Plate Spline (TPS) transformation models.
+    Scales residual threshold adaptively by GSD scale ratio.
     """
-    if len(pts0) < 4:
+    pts0 = np.asarray(pts0, dtype=np.float32)
+    pts1 = np.asarray(pts1, dtype=np.float32)
+
+    min_pts_required = 3 if model.lower() == "affine" else 4
+    if len(pts0) < min_pts_required:
         return {
             "success": False,
             "H": None,
+            "M": None,
+            "model_type": model,
             "inlier_mask": np.zeros(len(pts0), dtype=bool),
             "inlier_count": 0,
             "inlier_ratio": 0.0,
@@ -61,27 +131,69 @@ def estimate_robust_transformation(
             "residuals": np.array([])
         }
 
-    # Attempt USAC_MAGSAC with fallback to standard RANSAC
-    try:
-        H, mask = cv2.findHomography(
-            pts0, pts1,
-            method=cv2.USAC_MAGSAC,
-            ransacReprojThreshold=ransac_thresh,
-            maxIters=max_iters,
-            confidence=confidence
-        )
-    except Exception:
-        H, mask = cv2.findHomography(
-            pts0, pts1,
-            method=cv2.RANSAC,
-            ransacReprojThreshold=ransac_thresh,
-            maxIters=max_iters
-        )
+    # Adaptive threshold scaled by GSD scale ratio
+    ratio = float(gsd_ratio) if gsd_ratio > 0 else 1.0
+    scale_factor = max(1.0, min(ratio, 1.0 / ratio) ** 0.5) if (ratio > 1.05 or ratio < 0.95) else 1.0
+    adaptive_thresh = float(ransac_thresh * scale_factor)
+
+    model_lower = model.lower()
+    H = None
+    M = None
+    mask = None
+
+    if model_lower == "affine":
+        # Estimate Affine transformation (prevents shear distortion across planetary scales)
+        try:
+            M, inliers = cv2.estimateAffine2D(
+                pts0, pts1,
+                method=cv2.USAC_MAGSAC,
+                ransacReprojThreshold=adaptive_thresh,
+                maxIters=max_iters,
+                confidence=confidence
+            )
+            mask = inliers
+        except Exception:
+            try:
+                M, inliers = cv2.estimateAffinePartial2D(
+                    pts0, pts1,
+                    method=cv2.RANSAC,
+                    ransacReprojThreshold=adaptive_thresh,
+                    maxIters=max_iters
+                )
+                mask = inliers
+            except Exception:
+                M, mask = None, None
+
+        if M is not None:
+            # Construct 3x3 homogeneous matrix representation for unified evaluation
+            H = np.vstack([M, [0.0, 0.0, 1.0]])
+
+    else:
+        # Default Homography (USAC_MAGSAC with standard RANSAC fallback)
+        try:
+            H, mask = cv2.findHomography(
+                pts0, pts1,
+                method=cv2.USAC_MAGSAC,
+                ransacReprojThreshold=adaptive_thresh,
+                maxIters=max_iters,
+                confidence=confidence
+            )
+        except Exception:
+            H, mask = cv2.findHomography(
+                pts0, pts1,
+                method=cv2.RANSAC,
+                ransacReprojThreshold=adaptive_thresh,
+                maxIters=max_iters
+            )
+        if H is not None:
+            M = H[:2, :]
 
     if H is None or mask is None:
         return {
             "success": False,
             "H": None,
+            "M": None,
+            "model_type": model,
             "inlier_mask": np.zeros(len(pts0), dtype=bool),
             "inlier_count": 0,
             "inlier_ratio": 0.0,
@@ -97,17 +209,85 @@ def estimate_robust_transformation(
     inlier_pts1 = pts1[inlier_mask]
     rmse, residuals = compute_reprojection_rmse(inlier_pts0, inlier_pts1, H)
 
+    # Scale consistency check
+    scale_consistency = compute_scale_consistency(H, expected_scale_ratio=gsd_ratio)
+
     return {
         "success": True,
         "H": H,
+        "M": M,
+        "model_type": model,
         "inlier_mask": inlier_mask,
         "inlier_count": inlier_count,
         "inlier_ratio": round(inlier_ratio, 4),
         "rmse": rmse,
         "residuals": residuals,
         "inlier_pts0": inlier_pts0,
-        "inlier_pts1": inlier_pts1
+        "inlier_pts1": inlier_pts1,
+        "adaptive_thresh": adaptive_thresh,
+        "scale_consistency": scale_consistency
     }
+
+
+def warp_lunar_image_memory_safe(
+    img_to_warp: np.ndarray,
+    ref_shape: Tuple[int, int],
+    H_or_M: np.ndarray,
+    is_affine: bool = False,
+    interpolation: int = cv2.INTER_CUBIC,
+    max_tile_size: int = 4096
+) -> np.ndarray:
+    """
+    Memory-safe dual warping for large lunar canvases (> 4096 x 4096 px).
+    Prevents Out-Of-Memory (OOM) crashes by tiling large arrays during warpPerspective / warpAffine.
+    """
+    h_ref, w_ref = ref_shape[:2]
+
+    # Standard direct warping if dimensions within safe threshold
+    if h_ref <= max_tile_size and w_ref <= max_tile_size:
+        if is_affine or H_or_M.shape == (2, 3):
+            M = H_or_M[:2, :]
+            return cv2.warpAffine(img_to_warp, M, (w_ref, h_ref), flags=interpolation, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        else:
+            return cv2.warpPerspective(img_to_warp, H_or_M, (w_ref, h_ref), flags=interpolation, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+    # Tiled memory-safe warping
+    tile_size = 2048
+    out_shape = (h_ref, w_ref) if img_to_warp.ndim == 2 else (h_ref, w_ref, img_to_warp.shape[2])
+    warped_full = np.zeros(out_shape, dtype=img_to_warp.dtype)
+
+    for y0 in range(0, h_ref, tile_size):
+        y1 = min(y0 + tile_size, h_ref)
+        tile_h = y1 - y0
+        for x0 in range(0, w_ref, tile_size):
+            x1 = min(x0 + tile_size, w_ref)
+            tile_w = x1 - x0
+
+            # Translation matrix shifting tile origin to (0, 0)
+            # T_shift * H maps coordinates so (x0, y0) is at (0, 0) in tile
+            T_shift = np.array([
+                [1.0, 0.0, -float(x0)],
+                [0.0, 1.0, -float(y0)],
+                [0.0, 0.0, 1.0]
+            ], dtype=np.float64)
+
+            if is_affine or H_or_M.shape == (2, 3):
+                H_3x3 = np.vstack([H_or_M[:2, :], [0.0, 0.0, 1.0]])
+                tile_H = T_shift @ H_3x3
+                tile_warp = cv2.warpAffine(
+                    img_to_warp, tile_H[:2, :], (tile_w, tile_h),
+                    flags=interpolation, borderMode=cv2.BORDER_CONSTANT, borderValue=0
+                )
+            else:
+                tile_H = T_shift @ H_or_M
+                tile_warp = cv2.warpPerspective(
+                    img_to_warp, tile_H, (tile_w, tile_h),
+                    flags=interpolation, borderMode=cv2.BORDER_CONSTANT, borderValue=0
+                )
+
+            warped_full[y0:y1, x0:x1] = tile_warp
+
+    return warped_full
 
 
 def warp_lunar_image(
@@ -119,11 +299,8 @@ def warp_lunar_image(
     """
     Warps target image onto reference image coordinate frame using homography H.
     """
-    h_ref, w_ref = ref_shape[:2]
-    # H maps pts0 (ref) -> pts1 (target). To warp target to ref, cv2.warpPerspective requires H_inv:
-    # However, if H was computed with findHomography(pts_target, pts_ref), then H maps target -> ref.
-    warped = cv2.warpPerspective(img_to_warp, H, (w_ref, h_ref), flags=interpolation, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-    return warped
+    return warp_lunar_image_memory_safe(img_to_warp, ref_shape, H, is_affine=False, interpolation=interpolation)
+
 
 
 class ThinPlateSplineWarp:
