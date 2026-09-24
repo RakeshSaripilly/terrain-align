@@ -119,6 +119,7 @@ def normalized_gradient_field(
 
 
 SENSOR_GSD = {
+    "ohr": 0.25,
     "ohrc": 0.25,
     "tmc": 5.0,
     "tmc2": 5.0,
@@ -127,6 +128,7 @@ SENSOR_GSD = {
     "nac": 0.5,
     "lro": 0.5,
     "selene": 10.0,
+    "kaguya": 10.0,
 }
 
 
@@ -212,26 +214,58 @@ def preprocess_lunar_pair(
     return img0_scaled, img1_scaled, scale0, scale1
 
 
+def make_affine_transform(
+    scale_x: float,
+    scale_y: float,
+    tx: float = 0.0,
+    ty: float = 0.0
+) -> np.ndarray:
+    """Creates a 3x3 homogeneous affine transformation matrix."""
+    return np.array([
+        [float(scale_x), 0.0, float(tx)],
+        [0.0, float(scale_y), float(ty)],
+        [0.0, 0.0, 1.0]
+    ], dtype=np.float64)
+
+
+def apply_coordinate_transform(pts: np.ndarray, transform_matrix: np.ndarray) -> np.ndarray:
+    """
+    Applies a 3x3 affine or projective transformation matrix to (N, 2) coordinates.
+    pts_out = (T @ [x, y, 1]^T)^T
+    """
+    if pts is None or len(pts) == 0:
+        return np.empty((0, 2), dtype=np.float32)
+    pts_arr = np.asarray(pts, dtype=np.float32)
+    pts_h = np.column_stack([pts_arr, np.ones(len(pts_arr), dtype=np.float32)])
+    transformed_h = (transform_matrix @ pts_h.T).T
+    denom = transformed_h[:, 2:3]
+    denom = np.where(np.abs(denom) < 1e-12, 1e-12, denom)
+    return (transformed_h[:, :2] / denom).astype(np.float32)
+
+
 def create_gsd_normalized_pair(
     img_src_input: Union[str, np.ndarray],
     img_ref_input: Union[str, np.ndarray],
     gsd_src: Optional[float] = None,
     gsd_ref: Optional[float] = None,
+    target_common_gsd: Optional[float] = None,
     resize_long: int = 1024,
-    use_multiscale: bool = True
+    use_multiscale: bool = True,
+    verbose: bool = True
 ) -> Dict[str, Any]:
     """
-    GSD-Aware Scale Normalization Layer for multi-resolution lunar imagery.
+    GSD-Aware Physical Scale Normalization Layer for multi-resolution lunar imagery.
     
-    Computes scale ratio s = GSD_ref / GSD_src.
-    - If s > 1.05: Source has higher resolution (smaller GSD in m/px).
-      Convolves source with MTF Gaussian blur and downsamples by 1/s via INTER_AREA.
-    - If s < 0.95: Reference has higher resolution.
-      Convolves reference with MTF Gaussian blur and downsamples by s via INTER_AREA.
-    - Then applies radiometric MS-LCN and resizes to resize_long (divisible by 8).
-    
-    Returns dictionary with virtual coarse images, native full-resolution images,
-    and cumulative coordinate scale factors for accurate back-projection.
+    Architecture:
+    1. Determine a deterministic Common Physical GSD = target_common_gsd or max(gsd_src, gsd_ref).
+    2. Convert both images to represent the exact same physical ground sampling distance:
+       - If an image has finer resolution (gsd < common_gsd), downsample by (gsd / common_gsd)
+         after applying sensor MTF Gaussian low-pass filtering.
+    3. Construct explicit 3x3 affine coordinate transformation matrices for exact bi-directional
+       mapping: Native <-> Common GSD <-> Scaled Matcher coordinates.
+    4. Apply radiometric MS-LCN / LCN.
+    5. Centralized matcher resizing: Rescale both common-GSD images by a SHARED scale factor,
+       strictly preserving the 1:1 physical scale relationship established in Step 2.
     """
     # Infer GSD if not provided
     if gsd_src is None and isinstance(img_src_input, (str, Path)):
@@ -243,87 +277,143 @@ def create_gsd_normalized_pair(
     gsd_ref_val = float(gsd_ref) if gsd_ref is not None and gsd_ref > 0 else 1.0
     scale_ratio = gsd_ref_val / gsd_src_val  # s = GSD_ref / GSD_src
 
+    # 1. Choose Common Physical GSD explicitly
+    if target_common_gsd is not None and target_common_gsd > 0:
+        common_gsd = float(target_common_gsd)
+    else:
+        common_gsd = max(gsd_src_val, gsd_ref_val)
+
     img_src_native = load_lunar_image(img_src_input)
     img_ref_native = load_lunar_image(img_ref_input)
 
-    # Initial downsample factor before LoFTR resize
-    s_src_gsd = 1.0
-    s_ref_gsd = 1.0
+    h_src_nat, w_src_nat = img_src_native.shape[:2]
+    h_ref_nat, w_ref_nat = img_ref_native.shape[:2]
 
-    if scale_ratio > 1.05:
-        # Source has higher resolution -> downsample source to match reference GSD
-        src_blurred = apply_mtf_gaussian_filter(img_src_native, scale_ratio)
-        new_w = max(int(round(img_src_native.shape[1] / scale_ratio)), 16)
-        new_h = max(int(round(img_src_native.shape[0] / scale_ratio)), 16)
-        img_src_virtual = cv2.resize(src_blurred, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        s_src_gsd = new_w / float(img_src_native.shape[1])
-        img_ref_virtual = img_ref_native.copy()
-    elif scale_ratio < 0.95:
-        # Reference has higher resolution -> downsample reference to match source GSD
-        inv_ratio = 1.0 / scale_ratio
+    # 2. Normalize both images to Common Physical GSD
+    # Physical scale downsampling factor s_phys = gsd_image / common_gsd <= 1.0
+    s_src_phys = gsd_src_val / common_gsd
+    s_ref_phys = gsd_ref_val / common_gsd
+
+    # Source normalization
+    if s_src_phys < 0.98:
+        inv_ratio = common_gsd / gsd_src_val
+        src_blurred = apply_mtf_gaussian_filter(img_src_native, inv_ratio)
+        new_w_src = max(int(round(w_src_nat * s_src_phys)), 16)
+        new_h_src = max(int(round(h_src_nat * s_src_phys)), 16)
+        img_src_common = cv2.resize(src_blurred, (new_w_src, new_h_src), interpolation=cv2.INTER_AREA)
+        s_src_gsd_x = new_w_src / float(w_src_nat)
+        s_src_gsd_y = new_h_src / float(h_src_nat)
+    else:
+        img_src_common = img_src_native.copy()
+        s_src_gsd_x = 1.0
+        s_src_gsd_y = 1.0
+
+    # Reference normalization
+    if s_ref_phys < 0.98:
+        inv_ratio = common_gsd / gsd_ref_val
         ref_blurred = apply_mtf_gaussian_filter(img_ref_native, inv_ratio)
-        new_w = max(int(round(img_ref_native.shape[1] * scale_ratio)), 16)
-        new_h = max(int(round(img_ref_native.shape[0] * scale_ratio)), 16)
-        img_ref_virtual = cv2.resize(ref_blurred, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        s_ref_gsd = new_w / float(img_ref_native.shape[1])
-        img_src_virtual = img_src_native.copy()
+        new_w_ref = max(int(round(w_ref_nat * s_ref_phys)), 16)
+        new_h_ref = max(int(round(h_ref_nat * s_ref_phys)), 16)
+        img_ref_common = cv2.resize(ref_blurred, (new_w_ref, new_h_ref), interpolation=cv2.INTER_AREA)
+        s_ref_gsd_x = new_w_ref / float(w_ref_nat)
+        s_ref_gsd_y = new_h_ref / float(h_ref_nat)
     else:
-        img_src_virtual = img_src_native.copy()
-        img_ref_virtual = img_ref_native.copy()
+        img_ref_common = img_ref_native.copy()
+        s_ref_gsd_x = 1.0
+        s_ref_gsd_y = 1.0
 
-    # Preprocess with MS-LCN
+    # 3. Explicit affine transforms: Native <-> Common GSD
+    T_src_nat_to_com = make_affine_transform(s_src_gsd_x, s_src_gsd_y)
+    T_src_com_to_nat = make_affine_transform(1.0 / s_src_gsd_x, 1.0 / s_src_gsd_y)
+
+    T_ref_nat_to_com = make_affine_transform(s_ref_gsd_x, s_ref_gsd_y)
+    T_ref_com_to_nat = make_affine_transform(1.0 / s_ref_gsd_x, 1.0 / s_ref_gsd_y)
+
+    # 4. Radiometric normalization (MS-LCN / LCN)
     if use_multiscale:
-        src_norm = multi_scale_lcn(img_src_virtual, kernel_small=25, kernel_large=71)
-        ref_norm = multi_scale_lcn(img_ref_virtual, kernel_small=25, kernel_large=71)
+        src_norm = multi_scale_lcn(img_src_common, kernel_small=25, kernel_large=71)
+        ref_norm = multi_scale_lcn(img_ref_common, kernel_small=25, kernel_large=71)
     else:
-        src_norm = local_contrast_normalization(img_src_virtual, kernel_size=71)
-        ref_norm = local_contrast_normalization(img_ref_virtual, kernel_size=71)
+        src_norm = local_contrast_normalization(img_src_common, kernel_size=71)
+        ref_norm = local_contrast_normalization(img_ref_common, kernel_size=71)
 
     src_u8 = (src_norm * 255.0).astype(np.uint8)
     ref_u8 = (ref_norm * 255.0).astype(np.uint8)
 
-    # Scale to resize_long divisible by 8 for LoFTR
-    def scale_div8(img: np.ndarray, target_long: int) -> Tuple[np.ndarray, float]:
+    # 5. Centralized matcher resizing preserving common physical scale
+    # Apply a single shared scale factor so the physical GSD relationship remains 1:1
+    h_src_c, w_src_c = src_u8.shape[:2]
+    h_ref_c, w_ref_c = ref_u8.shape[:2]
+    max_dim_common = max(h_src_c, w_src_c, h_ref_c, w_ref_c)
+
+    if max_dim_common > resize_long:
+        shared_scale = float(resize_long) / float(max_dim_common)
+    else:
+        shared_scale = 1.0
+
+    def fit_matcher_div8(img: np.ndarray, scale: float) -> Tuple[np.ndarray, float, float]:
         h, w = img.shape[:2]
-        long_dim = max(h, w)
-        if long_dim > target_long:
-            scale = target_long / float(long_dim)
-            new_w = (int(round(w * scale)) // 8) * 8
-            new_h = (int(round(h * scale)) // 8) * 8
-            new_w = max(new_w, 64)
-            new_h = max(new_h, 64)
-            resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-            return resized, new_w / float(w)
-        else:
-            new_w = (w // 8) * 8
-            new_h = (h // 8) * 8
-            new_w = max(new_w, 64)
-            new_h = max(new_h, 64)
-            if new_w != w or new_h != h:
-                resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                return resized, new_w / float(w)
-            return img, 1.0
+        new_w = max((int(round(w * scale)) // 8) * 8, 64)
+        new_h = max((int(round(h * scale)) // 8) * 8, 64)
+        if new_w != w or new_h != h:
+            interp = cv2.INTER_AREA if (new_w < w or new_h < h) else cv2.INTER_CUBIC
+            resized = cv2.resize(img, (new_w, new_h), interpolation=interp)
+            return resized, new_w / float(w), new_h / float(h)
+        return img.copy(), 1.0, 1.0
 
-    src_scaled, s_src_loftr = scale_div8(src_u8, resize_long)
-    ref_scaled, s_ref_loftr = scale_div8(ref_u8, resize_long)
+    src_scaled, s_src_m_x, s_src_m_y = fit_matcher_div8(src_u8, shared_scale)
+    ref_scaled, s_ref_m_x, s_ref_m_y = fit_matcher_div8(ref_u8, shared_scale)
 
-    # Total scale factor from native image to scaled matcher input:
-    # x_scaled = x_native * s_total  =>  x_native = x_scaled / s_total
-    s_src_total = s_src_gsd * s_src_loftr
-    s_ref_total = s_ref_gsd * s_ref_loftr
+    # Common <-> Matcher transforms
+    T_src_com_to_match = make_affine_transform(s_src_m_x, s_src_m_y)
+    T_src_match_to_com = make_affine_transform(1.0 / s_src_m_x, 1.0 / s_src_m_y)
+
+    T_ref_com_to_match = make_affine_transform(s_ref_m_x, s_ref_m_y)
+    T_ref_match_to_com = make_affine_transform(1.0 / s_ref_m_x, 1.0 / s_ref_m_y)
+
+    # 6. Cumulative full affine transforms: Native <-> Matcher
+    T_src_nat_to_match = T_src_com_to_match @ T_src_nat_to_com
+    T_src_match_to_nat = T_src_com_to_nat @ T_src_match_to_com
+
+    T_ref_nat_to_match = T_ref_com_to_match @ T_ref_nat_to_com
+    T_ref_match_to_nat = T_ref_com_to_nat @ T_ref_match_to_com
+
+    s_src_total_x = float(T_src_nat_to_match[0, 0])
+    s_ref_total_x = float(T_ref_nat_to_match[0, 0])
+
+    if verbose and (scale_ratio > 1.2 or scale_ratio < 0.8):
+        print(f"[GSD-NORMALIZATION] GSD src={gsd_src_val:.3f}m, ref={gsd_ref_val:.3f}m | Common GSD={common_gsd:.3f}m")
+        print(f"[GSD-NORMALIZATION] Native shapes: src=({h_src_nat},{w_src_nat}), ref=({h_ref_nat},{w_ref_nat})")
+        print(f"[GSD-NORMALIZATION] Common shapes: src=({h_src_c},{w_src_c}), ref=({h_ref_c},{w_ref_c})")
+        print(f"[GSD-NORMALIZATION] Matcher shapes: src={src_scaled.shape}, ref={ref_scaled.shape} (scale_src={s_src_total_x:.4f}, scale_ref={s_ref_total_x:.4f})")
 
     return {
         "img_src_scaled": src_scaled,
         "img_ref_scaled": ref_scaled,
-        "scale_src_total": s_src_total,
-        "scale_ref_total": s_ref_total,
-        "scale_src_gsd": s_src_gsd,
-        "scale_ref_gsd": s_ref_gsd,
-        "scale_ratio": scale_ratio,
-        "gsd_src": gsd_src_val,
-        "gsd_ref": gsd_ref_val,
+        "img_src_common": img_src_common,
+        "img_ref_common": img_ref_common,
         "img_src_native": img_src_native,
         "img_ref_native": img_ref_native,
+        "T_src_native_to_matcher": T_src_nat_to_match,
+        "T_src_matcher_to_native": T_src_match_to_nat,
+        "T_ref_native_to_matcher": T_ref_nat_to_match,
+        "T_ref_matcher_to_native": T_ref_match_to_nat,
+        "T_src_native_to_common": T_src_nat_to_com,
+        "T_src_common_to_native": T_src_com_to_nat,
+        "T_ref_native_to_common": T_ref_nat_to_com,
+        "T_ref_common_to_native": T_ref_com_to_nat,
+        "T_src_common_to_matcher": T_src_com_to_match,
+        "T_src_matcher_to_common": T_src_match_to_com,
+        "T_ref_common_to_matcher": T_ref_com_to_match,
+        "T_ref_matcher_to_common": T_ref_match_to_com,
+        "scale_src_total": s_src_total_x,
+        "scale_ref_total": s_ref_total_x,
+        "scale_src_gsd": s_src_phys,
+        "scale_ref_gsd": s_ref_phys,
+        "scale_ratio": scale_ratio,
+        "common_gsd": common_gsd,
+        "gsd_src": gsd_src_val,
+        "gsd_ref": gsd_ref_val,
     }
 
 

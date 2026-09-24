@@ -12,12 +12,13 @@ try:
         load_lunar_image,
         preprocess_lunar_pair,
         create_gsd_normalized_pair,
+        apply_coordinate_transform,
         infer_gsd_from_path,
         local_contrast_normalization,
         multi_scale_lcn,
         SENSOR_GSD
     )
-    from .matching_engine import LunarLoFTRMatcher
+    from .matching_engine import LunarLoFTRMatcher, ScaleSpacePyramidMatcher, generate_adaptive_scale_pyramid
     from .subpixel_uniformity import (
         refine_subpixel_lk,
         refine_subpixel_lk_native,
@@ -48,12 +49,13 @@ except (ImportError, ValueError):
         load_lunar_image,
         preprocess_lunar_pair,
         create_gsd_normalized_pair,
+        apply_coordinate_transform,
         infer_gsd_from_path,
         local_contrast_normalization,
         multi_scale_lcn,
         SENSOR_GSD
     )
-    from matching_engine import LunarLoFTRMatcher
+    from matching_engine import LunarLoFTRMatcher, ScaleSpacePyramidMatcher, generate_adaptive_scale_pyramid
     from subpixel_uniformity import (
         refine_subpixel_lk,
         refine_subpixel_lk_native,
@@ -89,7 +91,9 @@ class LunarCorrespondenceEngine:
     """
 
     def __init__(self, device: Optional[str] = None):
+        self.device = device
         self.matcher = LunarLoFTRMatcher(pretrained='outdoor', device=device)
+        self.pyramid_matcher = ScaleSpacePyramidMatcher(base_matcher=self.matcher, device=device)
 
     def match(
         self,
@@ -111,8 +115,8 @@ class LunarCorrespondenceEngine:
     ) -> Dict[str, Any]:
         """
         Executes GSD-normalized hierarchical correspondence pipeline:
-        GSD Scale Normalization -> MS-LCN -> LoFTR -> Spatial Grid Quota Binning ->
-        Sub-Pixel Gruen LSM / Native LK -> MAGSAC++ / Affine / TPS.
+        Physical GSD Normalization -> Multi-Scale LoFTR -> MAGSAC++ Verification ->
+        Spatial Grid Quota Binning -> Sub-Pixel Gruen LSM / Native LK -> Final Model Fit.
         """
         start_time = time.perf_counter()
 
@@ -127,38 +131,74 @@ class LunarCorrespondenceEngine:
         if gsd1 is None and isinstance(img1_input, (str, Path)):
             gsd1 = infer_gsd_from_path(img1_input)
 
-        # 1. GSD Scale Normalization Layer (MTF anti-aliasing & coarse virtual layer)
+        # 1. GSD Scale Normalization Layer (MTF anti-aliasing & common physical GSD)
         gsd_prep = create_gsd_normalized_pair(
             img_src_input=img1_input,
             img_ref_input=img0_input,
             gsd_src=gsd1,
             gsd_ref=gsd0,
             resize_long=resize_long,
-            use_multiscale=True
+            use_multiscale=True,
+            verbose=True
         )
 
         img0_scaled = gsd_prep["img_ref_scaled"]
         img1_scaled = gsd_prep["img_src_scaled"]
+        img0_native = gsd_prep["img_ref_native"]
+        img1_native = gsd_prep["img_src_native"]
         s0_total = gsd_prep["scale_ref_total"]
         s1_total = gsd_prep["scale_src_total"]
         scale_ratio = gsd_prep["scale_ratio"]
-        img0_native = gsd_prep["img_ref_native"]
-        img1_native = gsd_prep["img_src_native"]
+        common_gsd = gsd_prep["common_gsd"]
         gsd_ref_final = gsd_prep["gsd_ref"]
         gsd_src_final = gsd_prep["gsd_src"]
 
-        # 2. Deep Transformer Matching on virtual coarse layer
+        T_ref_nat_to_match = gsd_prep["T_ref_native_to_matcher"]
+        T_ref_match_to_nat = gsd_prep["T_ref_matcher_to_native"]
+        T_src_nat_to_match = gsd_prep["T_src_native_to_matcher"]
+        T_src_match_to_nat = gsd_prep["T_src_matcher_to_native"]
+
+        # 2. Scale-Aware Deep Correspondence Matching via ScaleSpacePyramidMatcher
         match_start = time.perf_counter()
-        raw_res = self.matcher.match(img0_scaled, img1_scaled, conf_thresh=conf_thresh)
-        raw_pts0 = raw_res['mkpts0']
-        raw_pts1 = raw_res['mkpts1']
-        raw_conf = raw_res['conf']
+        pyr_res = self.pyramid_matcher.match_scaled_pair(
+            img0_scaled=img0_scaled,
+            img1_scaled=img1_scaled,
+            scale_ratio=scale_ratio,
+            conf_thresh=conf_thresh,
+            ransac_thresh=ransac_thresh,
+            merge_levels=True
+        )
+
+        raw_pts0 = pyr_res["mkpts0"]
+        raw_pts1 = pyr_res["mkpts1"]
+        raw_conf = pyr_res["conf"]
         match_time = time.perf_counter() - match_start
 
-        # 3. Spatial Grid Partitioning (Uniform Distribution Enforcement)
-        if enforce_uniformity and len(raw_pts0) > 10:
+        # 3. Geometric Verification (MAGSAC++) BEFORE Spatial Quota Filtering
+        # Spatial quota filtering should not determine correspondence quality before geometric verification.
+        # Geometry establishes which candidate matches are actually consistent.
+        initial_geom = estimate_robust_transformation(
+            raw_pts0, raw_pts1,
+            ransac_thresh=ransac_thresh,
+            model=model,
+            gsd_ratio=scale_ratio,
+            expected_residual_scale=1.0
+        )
+
+        if initial_geom["success"] and initial_geom["inlier_count"] >= 4:
+            geom_inlier_mask = initial_geom["inlier_mask"]
+            candidate_pts0 = raw_pts0[geom_inlier_mask]
+            candidate_pts1 = raw_pts1[geom_inlier_mask]
+            candidate_conf = raw_conf[geom_inlier_mask]
+        else:
+            candidate_pts0 = raw_pts0
+            candidate_pts1 = raw_pts1
+            candidate_conf = raw_conf
+
+        # 4. Spatial Grid Partitioning (Uniform Distribution Enforcement on Verified Inliers)
+        if enforce_uniformity and len(candidate_pts0) > 10:
             unif_pts0, unif_pts1, unif_conf = spatial_grid_quota_binning(
-                raw_pts0, raw_pts1, raw_conf,
+                candidate_pts0, candidate_pts1, candidate_conf,
                 img_shape=img0_scaled.shape,
                 grid_size=8,
                 k_min=k_min,
@@ -170,12 +210,12 @@ class LunarCorrespondenceEngine:
                     unif_pts0, unif_pts1, unif_conf, max_points=max_uniform_points
                 )
         else:
-            unif_pts0, unif_pts1, unif_conf = raw_pts0, raw_pts1, raw_conf
+            unif_pts0, unif_pts1, unif_conf = candidate_pts0, candidate_pts1, candidate_conf
 
-        # 4. Sub-Pixel Back-Projection & Local Refinement in Native Resolution
-        # Back-project coordinates from virtual scaled layer to native resolution:
-        pts0_native = unif_pts0 / s0_total if len(unif_pts0) > 0 else np.empty((0, 2), dtype=np.float32)
-        pts1_native = unif_pts1 / s1_total if len(unif_pts1) > 0 else np.empty((0, 2), dtype=np.float32)
+        # 5. Sub-Pixel Back-Projection & Local Refinement in Native Resolution
+        # Use exact affine coordinate transforms instead of scalar approximations:
+        pts0_native = apply_coordinate_transform(unif_pts0, T_ref_match_to_nat)
+        pts1_native = apply_coordinate_transform(unif_pts1, T_src_match_to_nat)
 
         if subpixel_refinement and len(pts0_native) >= 4:
             # Hybrid refinement: Gruen Least Squares Matching (LSM) + cornerSubPix/LK fallback
@@ -183,30 +223,27 @@ class LunarCorrespondenceEngine:
                 img0_native, img1_native, pts0_native, pts1_native,
                 window_size=15, max_iters=25
             )
-            pts0_to_estimate = ref_pts0_nat * s0_total
-            pts1_to_estimate = ref_pts1_nat * s1_total
+            pts0_to_estimate = apply_coordinate_transform(ref_pts0_nat, T_ref_nat_to_match)
+            pts1_to_estimate = apply_coordinate_transform(ref_pts1_nat, T_src_nat_to_match)
             conf_to_estimate = unif_conf[sub_mask] if len(unif_conf) == len(sub_mask) else np.ones(len(pts0_to_estimate), dtype=np.float32)
-            pts0_native_used = ref_pts0_nat
-            pts1_native_used = ref_pts1_nat
         else:
             pts0_to_estimate = unif_pts0
             pts1_to_estimate = unif_pts1
             conf_to_estimate = unif_conf
-            pts0_native_used = pts0_native
-            pts1_native_used = pts1_native
 
-        # 5. Robust Geometric Transformation & Outlier Rejection
+        # 6. Final Robust Geometric Transformation & Outlier Rejection
         geom = estimate_robust_transformation(
             pts0_to_estimate, pts1_to_estimate,
             ransac_thresh=ransac_thresh,
             model=model,
-            gsd_ratio=scale_ratio
+            gsd_ratio=scale_ratio,
+            expected_residual_scale=1.0
         )
 
-        # 6. Spatial Distribution Index (SDI) and ISRO Uniformity
         inlier_pts0 = geom["inlier_pts0"] if geom["success"] else pts0_to_estimate
         inlier_pts1 = geom["inlier_pts1"] if geom["success"] else pts1_to_estimate
 
+        # 7. Spatial Distribution Index (SDI) and ISRO Uniformity
         uniformity_metrics = compute_spatial_uniformity_metrics(
             inlier_pts0,
             img_shape=img0_scaled.shape,
@@ -214,7 +251,7 @@ class LunarCorrespondenceEngine:
         )
         sdi_val = compute_sdi_metric(inlier_pts0, img_shape=img0_scaled.shape, grid_divisions=8)
 
-        # 7. 80/20 Tie-Point / Check-Point Reprojection RMSE
+        # 8. 80/20 Tie-Point / Check-Point Reprojection RMSE
         chk_metrics = compute_checkpoint_rmse(
             inlier_pts0, inlier_pts1, geom["H"],
             split_ratio=0.8, gsd_ref=gsd_ref_final
@@ -222,9 +259,9 @@ class LunarCorrespondenceEngine:
 
         total_time = time.perf_counter() - start_time
 
-        # Convert inliers to native full-resolution coordinates
-        orig_inliers0 = inlier_pts0 / s0_total if geom["success"] else np.array([])
-        orig_inliers1 = inlier_pts1 / s1_total if geom["success"] else np.array([])
+        # Convert inliers to native full-resolution coordinates via exact coordinate transforms
+        orig_inliers0 = apply_coordinate_transform(inlier_pts0, T_ref_match_to_nat) if geom["success"] else np.empty((0, 2), dtype=np.float32)
+        orig_inliers1 = apply_coordinate_transform(inlier_pts1, T_src_match_to_nat) if geom["success"] else np.empty((0, 2), dtype=np.float32)
 
         return {
             "success": geom["success"],
@@ -244,10 +281,12 @@ class LunarCorrespondenceEngine:
             "tiepoint_rmse_meters": chk_metrics["tiepoint_rmse_meters"],
             "scale_consistency": geom.get("scale_consistency", {}),
             "scale_ratio": scale_ratio,
+            "common_gsd": common_gsd,
             "gsd_ref": gsd_ref_final,
             "gsd_src": gsd_src_final,
             "H_scaled": geom["H"].tolist() if geom["H"] is not None else None,
             "H_matrix": geom["H"],
+            "tps": geom.get("tps"),
             "scale0": s0_total,
             "scale1": s1_total,
             "pts0_scaled": pts0_to_estimate,
@@ -260,6 +299,10 @@ class LunarCorrespondenceEngine:
             "img1_scaled": img1_scaled,
             "img0_native": img0_native,
             "img1_native": img1_native,
+            "T_ref_native_to_matcher": T_ref_nat_to_match,
+            "T_ref_matcher_to_native": T_ref_match_to_nat,
+            "T_src_native_to_matcher": T_src_nat_to_match,
+            "T_src_matcher_to_native": T_src_match_to_nat,
             "elapsed_total_sec": round(total_time, 3),
             "elapsed_match_sec": round(match_time, 3)
         }
@@ -309,11 +352,16 @@ class LunarCorrespondenceEngine:
         visualize_spatial_distribution(img0_scaled.shape, inlier_pts0, out_path=density_path)
 
         similarity_metrics = {"ncc": 0.0, "mutual_information": 0.0, "psnr": 0.0}
-        if res["success"] and H is not None:
+        if res["success"]:
             try:
-                # Warp img1 onto img0 frame (img1 -> img0 requires H_inv if H is img0 -> img1)
-                H_inv = np.linalg.inv(H)
-                img1_warped = warp_lunar_image(img1_scaled, img0_scaled.shape, H_inv)
+                # Warp img1 onto img0 frame
+                if res.get("tps") is not None and model.lower() == "tps":
+                    img1_warped = warp_lunar_image(img1_scaled, img0_scaled.shape, res["tps"])
+                elif H is not None:
+                    H_inv = np.linalg.inv(H)
+                    img1_warped = warp_lunar_image(img1_scaled, img0_scaled.shape, H_inv)
+                else:
+                    img1_warped = img1_scaled
 
                 # 3. Checkerboard Overlay
                 checker_path = os.path.join(out_dir, "checkerboard_overlay.jpg")

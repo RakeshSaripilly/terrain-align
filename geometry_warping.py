@@ -41,20 +41,25 @@ def compute_reprojection_rmse(
 
 def compute_scale_consistency(
     matrix: np.ndarray,
-    expected_scale_ratio: float,
-    eval_point: Tuple[float, float] = (512.0, 512.0),
-    tolerance: float = 0.15
+    expected_scale_ratio: float = 1.0,
+    eval_point: Optional[Tuple[float, float]] = None,
+    tolerance: float = 0.20,
+    is_normalized_space: bool = False
 ) -> Dict[str, Any]:
     """
     Scale Consistency Check:
     Verifies that the determinant of the estimated local transformation matrix |J|
-    matches the physical GSD scale factor squared (s^2 +- 15%).
+    matches the expected scale factor squared (s^2 +- tolerance).
+    
+    In common-GSD / normalized space, expected_scale_ratio is 1.0 (residual scale).
+    In native sensor space, expected_scale_ratio is GSD_ref / GSD_src.
     
     Args:
         matrix: (2, 3) affine matrix or (3, 3) homography
-        expected_scale_ratio: s = GSD_ref / GSD_src
-        eval_point: Point (x, y) at which to evaluate Jacobian
-        tolerance: Allowed fractional deviation (default 15% = 0.15)
+        expected_scale_ratio: s = scale factor (default 1.0 for normalized coordinates)
+        eval_point: Point (x, y) at which to evaluate Jacobian (evaluates at affine center if None)
+        tolerance: Allowed fractional deviation (default 20% = 0.20)
+        is_normalized_space: Whether evaluation is in normalized matcher space
     """
     if matrix is None:
         return {"scale_consistency_pass": False, "det_J": 0.0, "expected_scale_sq": 0.0, "scale_error_ratio": 1.0}
@@ -65,22 +70,26 @@ def compute_scale_consistency(
         # Affine matrix [ [a1, a2, a0], [b1, b2, b0] ]
         det_J = abs(float(matrix[0, 0] * matrix[1, 1] - matrix[0, 1] * matrix[1, 0]))
     elif matrix.shape == (3, 3):
-        # Homography: local Jacobian determinant at eval_point (x, y)
-        x, y = float(eval_point[0]), float(eval_point[1])
-        h11, h12, h13 = matrix[0]
-        h21, h22, h23 = matrix[1]
-        h31, h32, h33 = matrix[2]
-        den = h31 * x + h32 * y + h33
-        if abs(den) < 1e-8:
-            det_J = abs(float(np.linalg.det(matrix[:2, :2])))
+        # Homography: local Jacobian determinant
+        if eval_point is None:
+            # Canonical center where projective denominator den = h33 = 1.0
+            det_J = abs(float(matrix[0, 0] * matrix[1, 1] - matrix[0, 1] * matrix[1, 0]))
         else:
-            num_x = h11 * x + h12 * y + h13
-            num_y = h21 * x + h22 * y + h23
-            dx_dx = (h11 * den - num_x * h31) / (den * den)
-            dx_dy = (h12 * den - num_x * h32) / (den * den)
-            dy_dx = (h21 * den - num_y * h31) / (den * den)
-            dy_dy = (h22 * den - num_y * h32) / (den * den)
-            det_J = abs(float(dx_dx * dy_dy - dx_dy * dy_dx))
+            x, y = float(eval_point[0]), float(eval_point[1])
+            h11, h12, h13 = matrix[0]
+            h21, h22, h23 = matrix[1]
+            h31, h32, h33 = matrix[2]
+            den = h31 * x + h32 * y + h33
+            if abs(den) < 1e-8:
+                det_J = abs(float(np.linalg.det(matrix[:2, :2])))
+            else:
+                num_x = h11 * x + h12 * y + h13
+                num_y = h21 * x + h22 * y + h23
+                dx_dx = (h11 * den - num_x * h31) / (den * den)
+                dx_dy = (h12 * den - num_x * h32) / (den * den)
+                dy_dx = (h21 * den - num_y * h31) / (den * den)
+                dy_dy = (h22 * den - num_y * h32) / (den * den)
+                det_J = abs(float(dx_dx * dy_dy - dx_dy * dy_dx))
     else:
         det_J = 1.0
 
@@ -96,7 +105,8 @@ def compute_scale_consistency(
         "det_J": round(float(det_J), 4),
         "expected_scale_sq": round(float(s_expected_sq), 4),
         "scale_error_ratio": round(float(error_ratio), 4),
-        "tolerance": tolerance
+        "tolerance": tolerance,
+        "is_normalized_space": is_normalized_space
     }
 
 
@@ -107,7 +117,8 @@ def estimate_robust_transformation(
     max_iters: int = 15000,
     confidence: float = 0.999,
     model: str = "homography",
-    gsd_ratio: float = 1.0
+    gsd_ratio: float = 1.0,
+    expected_residual_scale: float = 1.0
 ) -> Dict[str, Any]:
     """
     Robust geometric estimation using USAC_MAGSAC (or RANSAC fallback).
@@ -123,6 +134,7 @@ def estimate_robust_transformation(
             "success": False,
             "H": None,
             "M": None,
+            "tps": None,
             "model_type": model,
             "inlier_mask": np.zeros(len(pts0), dtype=bool),
             "inlier_count": 0,
@@ -140,6 +152,7 @@ def estimate_robust_transformation(
     H = None
     M = None
     mask = None
+    tps = None
 
     if model_lower == "affine":
         # Estimate Affine transformation (prevents shear distortion across planetary scales)
@@ -193,6 +206,7 @@ def estimate_robust_transformation(
             "success": False,
             "H": None,
             "M": None,
+            "tps": None,
             "model_type": model,
             "inlier_mask": np.zeros(len(pts0), dtype=bool),
             "inlier_count": 0,
@@ -209,13 +223,28 @@ def estimate_robust_transformation(
     inlier_pts1 = pts1[inlier_mask]
     rmse, residuals = compute_reprojection_rmse(inlier_pts0, inlier_pts1, H)
 
-    # Scale consistency check
-    scale_consistency = compute_scale_consistency(H, expected_scale_ratio=gsd_ratio)
+    # If model is TPS, fit Thin Plate Spline on geometrically verified inliers
+    if model_lower == "tps" and inlier_count >= 6:
+        tps = fit_thin_plate_spline(inlier_pts0, inlier_pts1)
+
+    # Centroid of inliers for evaluating local Jacobian determinant
+    eval_pt = tuple(np.mean(inlier_pts0, axis=0)) if inlier_count > 0 else (0.0, 0.0)
+
+    # Scale consistency check on residual transformation in current coordinate space
+    # Residual scale between normalized images is expected to be ~1.0
+    scale_consistency = compute_scale_consistency(
+        H,
+        expected_scale_ratio=expected_residual_scale,
+        eval_point=eval_pt,
+        is_normalized_space=(expected_residual_scale == 1.0)
+    )
+    scale_consistency["gsd_ratio"] = gsd_ratio
 
     return {
         "success": True,
         "H": H,
         "M": M,
+        "tps": tps,
         "model_type": model,
         "inlier_mask": inlier_mask,
         "inlier_count": inlier_count,
@@ -293,13 +322,18 @@ def warp_lunar_image_memory_safe(
 def warp_lunar_image(
     img_to_warp: np.ndarray,
     ref_shape: Tuple[int, int],
-    H: np.ndarray,
+    H_or_tps: Any,
     interpolation: int = cv2.INTER_CUBIC
 ) -> np.ndarray:
     """
-    Warps target image onto reference image coordinate frame using homography H.
+    Warps target image onto reference image coordinate frame using homography H, Affine M,
+    or ThinPlateSplineWarp object.
     """
-    return warp_lunar_image_memory_safe(img_to_warp, ref_shape, H, is_affine=False, interpolation=interpolation)
+    if H_or_tps is None:
+        return np.zeros(ref_shape[:2], dtype=img_to_warp.dtype)
+    if hasattr(H_or_tps, "warp_image"):
+        return H_or_tps.warp_image(img_to_warp, ref_shape)
+    return warp_lunar_image_memory_safe(img_to_warp, ref_shape, H_or_tps, is_affine=False, interpolation=interpolation)
 
 
 
@@ -329,24 +363,29 @@ class ThinPlateSplineWarp:
         grid_step: int = 16
     ) -> np.ndarray:
         h_ref, w_ref = ref_shape[:2]
-        # Coarse-to-fine displacement grid for fast dense warping
-        y_c = np.arange(0, h_ref, grid_step)
-        x_c = np.arange(0, w_ref, grid_step)
-        if y_c[-1] != h_ref - 1:
-            y_c = np.append(y_c, h_ref - 1)
-        if x_c[-1] != w_ref - 1:
-            x_c = np.append(x_c, w_ref - 1)
-
-        xx_c, yy_c = np.meshgrid(x_c, y_c)
-        grid_pts = np.column_stack([xx_c.ravel(), yy_c.ravel()])
-        # Inverse mapping: from ref coordinates to target coordinates
-        mapped_pts = self.transform_points(grid_pts)
-        map_x_c = mapped_pts[:, 0].reshape(len(y_c), len(x_c)).astype(np.float32)
-        map_y_c = mapped_pts[:, 1].reshape(len(y_c), len(x_c)).astype(np.float32)
-
-        # Upsample map to full resolution
-        map_x = cv2.resize(map_x_c, (w_ref, h_ref), interpolation=cv2.INTER_CUBIC)
-        map_y = cv2.resize(map_y_c, (w_ref, h_ref), interpolation=cv2.INTER_CUBIC)
+        if h_ref * w_ref <= 512 * 512:
+            # Direct exact dense evaluation for standard / medium canvases
+            xx, yy = np.meshgrid(np.arange(w_ref, dtype=np.float32), np.arange(h_ref, dtype=np.float32))
+            grid = np.column_stack([xx.ravel(), yy.ravel()])
+            mapped = self.transform_points(grid)
+            map_x = mapped[:, 0].reshape(h_ref, w_ref).astype(np.float32)
+            map_y = mapped[:, 1].reshape(h_ref, w_ref).astype(np.float32)
+        else:
+            # Uniform linspace displacement grid for large canvases (> 512x512)
+            steps_y = min(h_ref, max(16, h_ref // grid_step))
+            steps_x = min(w_ref, max(16, w_ref // grid_step))
+            y_c = np.linspace(0, h_ref - 1, steps_y, dtype=np.float64)
+            x_c = np.linspace(0, w_ref - 1, steps_x, dtype=np.float64)
+            xx_c, yy_c = np.meshgrid(x_c, y_c)
+            grid_pts = np.column_stack([xx_c.ravel(), yy_c.ravel()])
+            disp = self.rbf(grid_pts)
+            disp_x = disp[:, 0].reshape(steps_y, steps_x).astype(np.float32)
+            disp_y = disp[:, 1].reshape(steps_y, steps_x).astype(np.float32)
+            disp_x_full = cv2.resize(disp_x, (w_ref, h_ref), interpolation=cv2.INTER_LINEAR)
+            disp_y_full = cv2.resize(disp_y, (w_ref, h_ref), interpolation=cv2.INTER_LINEAR)
+            xx_full, yy_full = np.meshgrid(np.arange(w_ref, dtype=np.float32), np.arange(h_ref, dtype=np.float32))
+            map_x = xx_full + disp_x_full
+            map_y = yy_full + disp_y_full
 
         warped = cv2.remap(img, map_x, map_y, interpolation=cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
         return warped

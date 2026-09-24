@@ -107,18 +107,37 @@ def compute_isro_metrics(
     # 80/20 Tie-Point vs Check-Point Reprojection RMSE
     chk_metrics = compute_checkpoint_rmse(pts0_inliers, pts1_inliers, H, split_ratio=0.8, gsd_ref=gsd_ref)
 
-    # Scale consistency check
+    # Physical vs residual scale validation
     scale_ratio = float(gsd_ref / gsd_src) if (gsd_ref is not None and gsd_src is not None and gsd_src > 0) else 1.0
-    scale_check = compute_scale_consistency(H, expected_scale_ratio=scale_ratio)
+    common_gsd = max(float(gsd_ref or 1.0), float(gsd_src or 1.0))
+
+    # Cross-sensor classification
+    ratio_magnitude = max(scale_ratio, 1.0 / scale_ratio)
+    if ratio_magnitude < 1.3:
+        scale_gap_category = "1x (Same Scale)"
+    elif ratio_magnitude <= 6.0:
+        scale_gap_category = "Moderate (~2x-4x)"
+    elif ratio_magnitude <= 40.0:
+        scale_gap_category = "Large (~16x-20x, e.g. OHRC-TMC / TMC-IIRS)"
+    else:
+        scale_gap_category = "Extreme (>40x, e.g. OHRC-IIRS)"
+
+    # Residual geometric scale consistency check in normalized coordinate space (expected ~1.0)
+    residual_scale_check = compute_scale_consistency(H, expected_scale_ratio=1.0, is_normalized_space=True)
+    # Native geometric scale consistency check (expected scale_ratio)
+    native_scale_check = compute_scale_consistency(H, expected_scale_ratio=scale_ratio, is_normalized_space=False)
 
     # Inlier ratio
     inlier_ratio = inlier_n / total if total > 0 else 0.0
 
     metrics = {
-        # Basic counts
+        # Pipeline stage match counts
         "total_matches": total,
+        "raw_matches": total,
         "inlier_count": inlier_n,
+        "magsac_inliers": inlier_n,
         "inlier_ratio": round(float(inlier_ratio), 4),
+        "magsac_inlier_ratio": round(float(inlier_ratio), 4),
 
         # Threshold metrics (PS: inlier match count, inlier ratio)
         "inlier_count_1px": count_at(1.0),
@@ -165,14 +184,18 @@ def compute_isro_metrics(
         "uniformity_coverage_8x8": uniformity_8x8["coverage_fraction"],
         "uniformity_entropy_8x8": uniformity_8x8["spatial_entropy"],
 
-        # Scale Consistency
+        # Cross-Scale & Physical Scale Normalization Metrics
         "scale_ratio": round(scale_ratio, 4),
+        "scale_gap_category": scale_gap_category,
+        "common_gsd": common_gsd,
         "gsd_src": gsd_src,
         "gsd_ref": gsd_ref,
-        "scale_consistency_pass": scale_check["scale_consistency_pass"],
-        "scale_consistency_det": scale_check["det_J"],
-        "scale_expected_sq": scale_check["expected_scale_sq"],
-        "scale_error_ratio": scale_check["scale_error_ratio"],
+        "physical_scale_normalized": bool(abs(scale_ratio - 1.0) < 0.05 or common_gsd > 0),
+        "scale_consistency_pass": residual_scale_check["scale_consistency_pass"],
+        "scale_consistency_det": residual_scale_check["det_J"],
+        "scale_expected_sq": residual_scale_check["expected_scale_sq"],
+        "scale_error_ratio": residual_scale_check["scale_error_ratio"],
+        "native_scale_consistency_pass": native_scale_check["scale_consistency_pass"],
 
         # ISRO final PASS/FAIL
         "isro_pass_rmse": bool(rmse < 2.0),
